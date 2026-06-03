@@ -1,0 +1,6 @@
+{
+  "name": "Water Do",
+  "description": "A minimalist to-do list with a playful water-bubble design, interactive floating droplet sandbox, and physical double-tap freezing mechanic.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
