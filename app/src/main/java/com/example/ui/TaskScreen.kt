@@ -26,7 +26,15 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
+import android.content.Context
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import kotlin.math.abs
+import kotlin.math.sqrt
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
@@ -38,6 +46,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.Task
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlin.math.cos
@@ -69,6 +78,27 @@ fun TaskScreen(
     LaunchedEffect(Unit) {
         viewModel.bannerFlow.collectLatest { msg ->
             snackbarHostState.showSnackbar(msg)
+        }
+    }
+
+    // Play pop sound when a droplet is inflated/created
+    LaunchedEffect(Unit) {
+        viewModel.taskCreatedTrigger.collectLatest {
+            AudioFeedback.playBubblePop()
+        }
+    }
+
+    // Play ice cracking sound when frozen to cube
+    LaunchedEffect(Unit) {
+        viewModel.frostTrigger.collectLatest {
+            AudioFeedback.playIceCrack()
+        }
+    }
+
+    // Play bubble pop sound when melts or gets deleted
+    LaunchedEffect(Unit) {
+        viewModel.completedSplashTrigger.collectLatest {
+            AudioFeedback.playBubblePop()
         }
     }
 
@@ -241,10 +271,21 @@ fun TaskScreen(
 // Float helper for pixel conversions
 private val Int.rl: Dp get() = this.dp
 
+class IceCubePhysics(
+    val taskId: Int,
+    var px: Float = 0f,
+    var py: Float = 0f,
+    var vx: Float = 0f,
+    var vy: Float = 0f,
+    var radius: Float = 50f,
+    var isDragging: Boolean = false
+)
+
 /**
  * Interactive Sandboxed Container matching physical 2D floating movement.
  * Active water droplets wander randomly with organic wavy floating phases.
- * Ice Spheres sink and slide down to near the bottom, resting heavy but floating subtly.
+ * Ice Spheres sink, float depth-strategically matching priority size, slide on tilt with inertia,
+ * and return smoothly to native floating positions when device is level.
  */
 @Composable
 fun FloatingDropletsSandbox(
@@ -252,10 +293,271 @@ fun FloatingDropletsSandbox(
     viewModel: TaskViewModel,
     modifier: Modifier = Modifier
 ) {
+    val density = LocalDensity.current
+    val context = LocalContext.current
+
     BoxWithConstraints(modifier = modifier) {
         val arenaWidth = constraints.maxWidth.toFloat()
         val arenaHeight = constraints.maxHeight.toFloat()
         
+        // Track physics states in memory
+        val icePhysicsMap = remember { mutableStateMapOf<Int, IceCubePhysics>() }
+        var physicsTick by remember { mutableStateOf(0) }
+
+        // Capture Accelerometer sensory tilts
+        var tiltX by remember { mutableStateOf(0f) }
+        var tiltY by remember { mutableStateOf(0f) }
+
+        DisposableEffect(context) {
+            val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
+            val accelerometer = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+            
+            val listener = object : SensorEventListener {
+                override fun onSensorChanged(event: SensorEvent?) {
+                    if (event != null) {
+                        // Negate X to align slide with visual device tilt orientation
+                        tiltX = -event.values[0]
+                        tiltY = event.values[1]
+                    }
+                }
+                override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+            }
+            
+            sensorManager?.registerListener(listener, accelerometer, SensorManager.SENSOR_DELAY_GAME)
+            onDispose {
+                sensorManager?.unregisterListener(listener)
+            }
+        }
+
+        // Maintain in-memory physics simulations tick at regular FPS intervals
+        LaunchedEffect(tasks, arenaWidth, arenaHeight, tiltX, tiltY) {
+            if (arenaWidth <= 0f || arenaHeight <= 0f) return@LaunchedEffect
+            
+            // Sync current items (both completed and uncompleted)
+            tasks.forEach { task ->
+                if (!icePhysicsMap.containsKey(task.id)) {
+                    val startX = if (task.x == 0f) {
+                        (0.15f + ((task.id * 31) % 70) / 100f)
+                    } else task.x
+                    val startY = if (task.y == 0f) {
+                        (0.25f + ((task.id * 47) % 45) / 100f)
+                    } else task.y
+                    
+                    icePhysicsMap[task.id] = IceCubePhysics(
+                        taskId = task.id,
+                        px = startX * arenaWidth,
+                        py = startY * arenaHeight
+                    )
+                }
+            }
+            
+            // Remove deleted tasks
+            val activeIds = tasks.map { it.id }.toSet()
+            icePhysicsMap.keys.toList().forEach { id ->
+                if (!activeIds.contains(id)) {
+                    icePhysicsMap.remove(id)
+                }
+            }
+
+            while (true) {
+                val completionPercentage = if (tasks.isEmpty()) 0f else tasks.count { it.isCompleted }.toFloat() / tasks.size.toFloat()
+                val minHeightFrac = 0.12f
+                val maxHeightFrac = 0.42f
+                val currentFraction = minHeightFrac + (completionPercentage * (maxHeightFrac - minHeightFrac))
+                
+                // Top water level
+                val waterSurfaceY = arenaHeight * (1f - currentFraction)
+                
+                icePhysicsMap.forEach { (id, physics) ->
+                    val task = tasks.find { it.id == id } ?: return@forEach
+                    
+                    val bubbleSizePx = with(density) {
+                        val sizeDp = when (task.priority) {
+                            "High" -> 130.dp
+                            "Medium" -> 110.dp
+                            "Low" -> 90.dp
+                            else -> 110.dp
+                        }
+                        sizeDp.toPx() * task.sizeMultiplier
+                    }
+                    val itemRadius = bubbleSizePx / 2f
+                    physics.radius = itemRadius
+                    
+                    val bottomMarginPx = with(density) { 24.dp.toPx() } // Buffer to never touch absolute bottom screen edge
+                    val sideMarginPx = with(density) { 12.dp.toPx() }
+                    
+                    val waterStartY = waterSurfaceY
+                    val waterEndY = arenaHeight - bubbleSizePx - bottomMarginPx
+                    val waterDepthRange = maxOf(0f, waterEndY - waterStartY)
+                    
+                    val forceX: Float
+                    val forceY: Float
+
+                    if (task.isCompleted) {
+                        // Stratified vertical buoyant depths based on size (priority level)
+                        // Smaller ones float closer to surface, high priority larger ones sink closer to bottom
+                        val depthRatio = when (task.priority) {
+                            "Low" -> 0.12f   // Float near surface
+                            "Medium" -> 0.45f // Floating mid depth
+                            "High" -> 0.70f   // Sink deep but never touch absolute floor
+                            else -> 0.45f
+                        }
+                        
+                        val naturalY = waterStartY + (waterDepthRange * depthRatio)
+                        val naturalX = (if (task.x == 0f) 0.5f else task.x) * arenaWidth
+                        
+                        // Forces calculations
+                        val accX = tiltX * 0.48f
+                        val accY = tiltY * 0.48f
+                        
+                        val tiltMagnitude = sqrt(tiltX * tiltX + tiltY * tiltY)
+                        val isLeveled = tiltMagnitude < 1.0f
+                        
+                        // Dragging items back slowly to floating spot column when level
+                        val kRestoreY = 0.08f
+                        val kRestoreX = if (isLeveled) 0.03f else 0.005f
+                        
+                        forceX = accX + (naturalX - physics.px) * kRestoreX
+                        forceY = accY + (naturalY - physics.py) * kRestoreY
+                    } else {
+                        // Bubbles behavioral forces (hover on upper/mid sections, organic random drift)
+                        val naturalX = (if (task.x == 0f) (0.15f + ((task.id * 31) % 70) / 100f) else task.x) * arenaWidth
+                        val naturalY = (if (task.y == 0f) (0.25f + ((task.id * 47) % 45) / 100f) else task.y) * arenaHeight
+                        
+                        // Extremely light response to device sensor tilts
+                        val accX = tiltX * 0.15f
+                        val accY = tiltY * 0.15f
+                        
+                        // Gentle wave-like continuous wandering force
+                        val wavePhase = (System.currentTimeMillis() % 1000000) / 1000f + task.id * 1.618f
+                        val driftForceX = sin(wavePhase) * 0.18f
+                        val driftForceY = cos(wavePhase * 0.8f) * 0.18f
+                        
+                        val kRestoreX = 0.03f
+                        val kRestoreY = 0.03f
+                        
+                        forceX = accX + driftForceX + (naturalX - physics.px) * kRestoreX
+                        forceY = accY + driftForceY + (naturalY - physics.py) * kRestoreY
+                    }
+                    
+                    if (!physics.isDragging) {
+                        // Physics integration with fluid viscosity friction damping
+                        physics.vx = (physics.vx + forceX) * 0.90f
+                        physics.vy = (physics.vy + forceY) * 0.90f
+                        
+                        physics.px += physics.vx
+                        physics.py += physics.vy
+                    } else {
+                        physics.vx = 0f
+                        physics.vy = 0f
+                    }
+                    
+                    // Boundaries restrictions for horizontal bounds
+                    val minX = sideMarginPx
+                    val maxX = arenaWidth - bubbleSizePx - sideMarginPx
+                    if (maxX > minX) {
+                        if (physics.px < minX) {
+                            physics.px = minX
+                            physics.vx = -physics.vx * 0.3f
+                        } else if (physics.px > maxX) {
+                            physics.px = maxX
+                            physics.vx = -physics.vx * 0.3f
+                        }
+                    }
+                    
+                    // Containment boundaries inside fluid volume
+                    val minY = waterStartY
+                    val maxY = waterEndY
+                    if (maxY > minY) {
+                        if (physics.py < minY) {
+                            physics.py = minY
+                            physics.vy = -physics.vy * 0.3f
+                        } else if (physics.py > maxY) {
+                            physics.py = maxY
+                            physics.vy = -physics.vy * 0.3f
+                        }
+                    }
+                }
+
+                // Interactive 2D rigid circle collisions with overlap resolution and elastic bounce impulses
+                repeat(2) {
+                    val physList = icePhysicsMap.values.toList()
+                    for (i in 0 until physList.size) {
+                        val p1 = physList[i]
+                        val r1 = p1.radius
+                        val cx1 = p1.px + r1
+                        val cy1 = p1.py + r1
+                        
+                        for (j in i + 1 until physList.size) {
+                            val p2 = physList[j]
+                            val r2 = p2.radius
+                            val cx2 = p2.px + r2
+                            val cy2 = p2.py + r2
+                            
+                            val dx = cx2 - cx1
+                            val dy = cy2 - cy1
+                            val dist = sqrt(dx * dx + dy * dy)
+                            val minDist = r1 + r2
+                            
+                            if (dist < minDist && dist > 0.01f) {
+                                val overlap = minDist - dist
+                                val ux = dx / dist
+                                val uy = dy / dist
+                                
+                                // Resolve overlapping push factors
+                                when {
+                                    p1.isDragging && !p2.isDragging -> {
+                                        p2.px += ux * overlap
+                                        p2.py += uy * overlap
+                                    }
+                                    !p1.isDragging && p2.isDragging -> {
+                                        p1.px -= ux * overlap
+                                        p1.py -= uy * overlap
+                                    }
+                                    !p1.isDragging && !p2.isDragging -> {
+                                        p1.px -= ux * overlap * 0.5f
+                                        p1.py -= uy * overlap * 0.5f
+                                        p2.px += ux * overlap * 0.5f
+                                        p2.py += uy * overlap * 0.5f
+                                    }
+                                }
+                                
+                                // Direct cushion-bounce velocity response calculation
+                                val rvx = p2.vx - p1.vx
+                                val rvy = p2.vy - p1.vy
+                                val velAlongNormal = rvx * ux + rvy * uy
+                                
+                                if (velAlongNormal < 0f) {
+                                    val restitution = 0.45f
+                                    val impulse = -(1f + restitution) * velAlongNormal
+                                    
+                                    when {
+                                        p1.isDragging && !p2.isDragging -> {
+                                            p2.vx += impulse * ux
+                                            p2.vy += impulse * uy
+                                        }
+                                        !p1.isDragging && p2.isDragging -> {
+                                            p1.vx -= impulse * ux
+                                            p1.vy -= impulse * uy
+                                        }
+                                        !p1.isDragging && !p2.isDragging -> {
+                                            p1.vx -= impulse * ux * 0.5f
+                                            p1.vy -= impulse * uy * 0.5f
+                                            p2.vx += impulse * ux * 0.5f
+                                            p2.vy += impulse * uy * 0.5f
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                physicsTick = (physicsTick + 1) % 1000000
+                delay(16)
+            }
+        }
+
         // Endless loop driving dynamic fluid wave vectors (low overhead trig loop)
         val infiniteTransition = rememberInfiniteTransition(label = "fluid_waves")
         val continuousPhase by infiniteTransition.animateFloat(
@@ -271,7 +573,6 @@ fun FloatingDropletsSandbox(
         // Iterate through all tasks and display them at physical offsets
         tasks.forEachIndexed { index, task ->
             // Base normalized coordinates mapping [0.1f..0.9f] range of screen
-            // Initialize deterministically if not adjusted yet
             val baseFracX = if (task.x == 0f) {
                 0.15f + ((index * 31) % 70) / 100f
             } else task.x
@@ -284,45 +585,36 @@ fun FloatingDropletsSandbox(
             val activePhase = continuousPhase + (task.id * 1.618f)
             val waveAmplitude = 18f
             
-            // Soft drift offset only applies when not completed and not actively dragging
-            // Completed Ice Spheres are heavy and don't slide around matching wind currents, they sink with gravity!
             var isDragging by remember { mutableStateOf(false) }
 
-            // Target fractional heights.
-            // When frozen, it sinks to the bottom water wave reservoir dynamic vertical coordinate ~ 0.84f
-            val targetFracY = if (task.isCompleted) 0.84f else baseFracY
-            val animatedFracY by animateFloatAsState(
-                targetValue = targetFracY,
-                animationSpec = spring(
-                    dampingRatio = Spring.DampingRatioLowBouncy,
-                    stiffness = Spring.StiffnessVeryLow
-                ),
-                label = "ice_gravity"
-            )
-
-            val animatedFracX by animateFloatAsState(
-                targetValue = baseFracX,
-                animationSpec = spring(
-                    dampingRatio = Spring.DampingRatioNoBouncy,
-                    stiffness = Spring.StiffnessLow
-                ),
-                label = "x_slide"
-            )
-
-            // Convert fractions to absolute screen pixels
-            val pixelBaseX = animatedFracX * arenaWidth
-            val pixelBaseY = animatedFracY * arenaHeight
-
-            // Translate float offset
-            val driftX = if (!task.isCompleted && !isDragging) sin(activePhase) * waveAmplitude else 0f
-            val driftY = if (!task.isCompleted && !isDragging) cos(activePhase * 0.8f) * waveAmplitude else {
-                // If ice, show slow heavy breathing bobbing
-                if (!isDragging) sin(activePhase * 0.4f) * 4f else 0f
+            // Dynamic layout calculations
+            val finalX: Float
+            val finalY: Float
+            
+            val physics = icePhysicsMap[task.id]
+            if (physics != null) {
+                if (isDragging) {
+                    val dragX = baseFracX * arenaWidth
+                    val dragY = baseFracY * arenaHeight
+                    physics.px = dragX
+                    physics.py = dragY
+                    physics.vx = 0f
+                    physics.vy = 0f
+                    physics.isDragging = true
+                    finalX = dragX
+                    finalY = dragY
+                } else {
+                    val tick = physicsTick // Compose dependency binding
+                    finalX = physics.px
+                    finalY = physics.py
+                }
+            } else {
+                // Initial fallback rendering
+                val pixelBaseX = baseFracX * arenaWidth
+                val pixelBaseY = baseFracY * arenaHeight
+                finalX = pixelBaseX
+                finalY = pixelBaseY
             }
-
-            // Absolute calculated composition alignment offsets
-            val finalX = (pixelBaseX + driftX).coerceIn(40f, arenaWidth - 120f)
-            val finalY = (pixelBaseY + driftY).coerceIn(40f, arenaHeight - 120f)
 
             // Render interactive Droplet shape card
             FloatingDropletItem(
@@ -339,16 +631,32 @@ fun FloatingDropletsSandbox(
                     }
                     .pointerInput(task.id) {
                         detectDragGestures(
-                            onDragStart = { isDragging = true },
+                            onDragStart = {
+                                isDragging = true
+                                icePhysicsMap[task.id]?.isDragging = true
+                            },
                             onDrag = { change, dragAmount ->
                                 change.consume()
                                 // Translate drag offset into the coordinate ratio
                                 val newX = (baseFracX + dragAmount.x / arenaWidth).coerceIn(0.1f, 0.9f)
                                 val newY = (baseFracY + dragAmount.y / arenaHeight).coerceIn(0.15f, 0.88f)
                                 viewModel.updateTaskPosition(task.id, newX, newY)
+                                
+                                icePhysicsMap[task.id]?.let { phys ->
+                                    phys.px = newX * arenaWidth
+                                    phys.py = newY * arenaHeight
+                                    phys.vx = 0f
+                                    phys.vy = 0f
+                                }
                             },
-                            onDragEnd = { isDragging = false },
-                            onDragCancel = { isDragging = false }
+                            onDragEnd = {
+                                isDragging = false
+                                icePhysicsMap[task.id]?.isDragging = false
+                            },
+                            onDragCancel = {
+                                isDragging = false
+                                icePhysicsMap[task.id]?.isDragging = false
+                            }
                         )
                     }
             )

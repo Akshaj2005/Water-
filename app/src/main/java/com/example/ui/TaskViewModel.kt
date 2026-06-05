@@ -22,6 +22,10 @@ class TaskViewModel(
     private val _frostTrigger = MutableSharedFlow<Unit>(replay = 0)
     val frostTrigger: SharedFlow<Unit> = _frostTrigger.asSharedFlow()
 
+    // New task creation sound effect Trigger
+    private val _taskCreatedTrigger = MutableSharedFlow<Unit>(replay = 0)
+    val taskCreatedTrigger: SharedFlow<Unit> = _taskCreatedTrigger.asSharedFlow()
+
     // Banner message notifications
     private val _bannerFlow = MutableSharedFlow<String>(replay = 0)
     val bannerFlow: SharedFlow<String> = _bannerFlow.asSharedFlow()
@@ -37,6 +41,7 @@ class TaskViewModel(
     fun addTask(title: String, description: String, priority: String) {
         viewModelScope.launch {
             repository.addTask(title, description, priority)
+            _taskCreatedTrigger.emit(Unit)
             _bannerFlow.emit("New droplet inflated! 💧")
         }
     }
